@@ -3,10 +3,11 @@ use compact_str::CompactString;
 pub use compact_str::format_compact;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use smallvec::SmallVec;
+use std::fmt::Write as FmtWrite;
 use std::io::{self, BufWriter, Write};
 use std::panic;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -34,15 +35,19 @@ impl LogLevel {
 }
 
 struct LogMsg {
-    timestamp: chrono::DateTime<chrono::Local>,
     level: LogLevel,
     msg: CompactString,
 }
 
+enum LoggerCommand {
+    Msg(LogMsg),
+    Flush,
+    Shutdown,
+}
+
 pub struct FLog {
-    sender: Option<Sender<LogMsg>>,
+    sender: Option<Sender<LoggerCommand>>,
     thread_handle: Option<JoinHandle<()>>,
-    shutdown_flag: Arc<AtomicBool>,
     stats: Arc<LoggerStats>,
 }
 
@@ -72,99 +77,238 @@ impl FLog {
             #[cfg(feature = "local")]
             flush_local();
         }));
-        let (tx, rx) = unbounded::<LogMsg>();
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let shutdown_flag_clone = Arc::clone(&shutdown_flag);
+        let (tx, rx) = unbounded::<LoggerCommand>();
         let stats = Arc::new(LoggerStats::default());
         let stats_clone = Arc::clone(&stats);
 
         let handle = thread::spawn(move || {
-            Self::writer_loop(rx, shutdown_flag_clone, config, stats_clone);
+            Self::writer_loop(rx, config, stats_clone);
         });
 
         Self {
             sender: Some(tx),
             thread_handle: Some(handle),
-            shutdown_flag,
             stats,
         }
     }
 
-    fn writer_loop(
-        rx: Receiver<LogMsg>,
-        shutdown_flag: Arc<AtomicBool>,
-        config: LoggerConfig,
-        stats: Arc<LoggerStats>,
-    ) {
+    fn writer_loop(rx: Receiver<LoggerCommand>, config: LoggerConfig, stats: Arc<LoggerStats>) {
+        use LoggerCommand::*;
+
         let stderr = io::stderr();
         let mut writer = BufWriter::with_capacity(config.buffer_size, stderr);
         let mut batch: SmallVec<[LogMsg; 512]> = SmallVec::with_capacity(config.batch_size);
         let mut last_flush = Instant::now();
         let mut bytes_written_since_flush = 0usize;
 
-        let mut format_buf = CompactString::with_capacity(256);
+        thread_local! {
+            static TLS_FORMAT_BUF: std::cell::RefCell<CompactString> =
+                std::cell::RefCell::new(CompactString::with_capacity(256));
+        }
 
-        loop {
-            batch.clear();
-
-            match rx.recv() {
-                Ok(log) => batch.push(log),
-                Err(_) => break,
+        #[inline]
+        fn write_batch(
+            batch: &mut SmallVec<[LogMsg; 512]>,
+            writer: &mut BufWriter<io::Stderr>,
+            stats: &Arc<LoggerStats>,
+            bytes_written: &mut usize,
+        ) {
+            if batch.is_empty() {
+                return;
             }
 
-            while batch.len() < config.batch_size {
-                match rx.try_recv() {
-                    Ok(log) => batch.push(log),
-                    Err(_) => break,
-                }
-            }
-
-            for log in &batch {
-                format_buf.clear();
-
-                use std::fmt::Write as FmtWrite;
-                let _ = write!(
-                    format_buf,
-                    "{} [{}] {}\n",
-                    log.timestamp.format("%Y-%m-%d %H:%M:%S"),
-                    log.level.as_str(),
-                    log.msg
-                );
-
-                let _ = writer.write_all(format_buf.as_bytes());
-                bytes_written_since_flush += format_buf.len();
+            for log in batch.iter() {
+                TLS_FORMAT_BUF.with(|buf_cell| {
+                    let mut buf = buf_cell.borrow_mut();
+                    buf.clear();
+                    let _ = write!(
+                        buf,
+                        "{} [{}] {}\n",
+                        Local::now().format("%Y-%m-%d %H:%M:%S"),
+                        log.level.as_str(),
+                        log.msg
+                    );
+                    let _ = writer.write_all(buf.as_bytes());
+                    *bytes_written += buf.len();
+                });
             }
 
             stats
                 .messages_written
                 .fetch_add(batch.len() as u64, Ordering::Relaxed);
-
-            let should_flush = bytes_written_since_flush >= config.flush_threshold
-                || batch.len() >= config.flush_batch_threshold
-                || last_flush.elapsed() >= config.flush_interval
-                || shutdown_flag.load(Ordering::Relaxed);
-
-            if should_flush {
-                let _ = writer.flush();
-                stats.flushes_performed.fetch_add(1, Ordering::Relaxed);
-                last_flush = Instant::now();
-                bytes_written_since_flush = 0;
-            }
+            batch.clear();
         }
 
-        let _ = writer.flush();
-        stats.flushes_performed.fetch_add(1, Ordering::Relaxed);
+        #[inline]
+        fn flush_writer(
+            writer: &mut BufWriter<io::Stderr>,
+            stats: &Arc<LoggerStats>,
+            last_flush: &mut Instant,
+            bytes_written: &mut usize,
+        ) {
+            let _ = writer.flush();
+            stats.flushes_performed.fetch_add(1, Ordering::Relaxed);
+            *last_flush = Instant::now();
+            *bytes_written = 0;
+        }
+
+        loop {
+            match rx.recv() {
+                Ok(Msg(log)) => {
+                    batch.push(log);
+
+                    while batch.len() < config.batch_size {
+                        match rx.try_recv() {
+                            Ok(Msg(log)) => batch.push(log),
+                            Ok(Flush) => {
+                                write_batch(
+                                    &mut batch,
+                                    &mut writer,
+                                    &stats,
+                                    &mut bytes_written_since_flush,
+                                );
+                                flush_writer(
+                                    &mut writer,
+                                    &stats,
+                                    &mut last_flush,
+                                    &mut bytes_written_since_flush,
+                                );
+                            }
+                            Ok(Shutdown) => {
+                                write_batch(
+                                    &mut batch,
+                                    &mut writer,
+                                    &stats,
+                                    &mut bytes_written_since_flush,
+                                );
+                                flush_writer(
+                                    &mut writer,
+                                    &stats,
+                                    &mut last_flush,
+                                    &mut bytes_written_since_flush,
+                                );
+
+                                while let Ok(cmd) = rx.try_recv() {
+                                    if let LoggerCommand::Msg(log) = cmd {
+                                        TLS_FORMAT_BUF.with(|buf_cell| {
+                                            let mut buf = buf_cell.borrow_mut();
+                                            buf.clear();
+                                            let _ = write!(
+                                                buf,
+                                                "{} [{}] {}\n",
+                                                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                                                log.level.as_str(),
+                                                log.msg
+                                            );
+                                            let _ = writer.write_all(buf.as_bytes());
+                                        });
+                                        stats.messages_written.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+
+                                let _ = writer.flush();
+                                stats.flushes_performed.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    let should_flush = bytes_written_since_flush >= config.flush_threshold
+                        || batch.len() >= config.flush_batch_threshold
+                        || last_flush.elapsed() >= config.flush_interval;
+
+                    if should_flush || batch.len() >= config.batch_size {
+                        write_batch(
+                            &mut batch,
+                            &mut writer,
+                            &stats,
+                            &mut bytes_written_since_flush,
+                        );
+                    }
+
+                    if should_flush {
+                        flush_writer(
+                            &mut writer,
+                            &stats,
+                            &mut last_flush,
+                            &mut bytes_written_since_flush,
+                        );
+                    }
+                }
+
+                Ok(Flush) => {
+                    write_batch(
+                        &mut batch,
+                        &mut writer,
+                        &stats,
+                        &mut bytes_written_since_flush,
+                    );
+                    flush_writer(
+                        &mut writer,
+                        &stats,
+                        &mut last_flush,
+                        &mut bytes_written_since_flush,
+                    );
+                }
+
+                Ok(Shutdown) => {
+                    write_batch(
+                        &mut batch,
+                        &mut writer,
+                        &stats,
+                        &mut bytes_written_since_flush,
+                    );
+                    flush_writer(
+                        &mut writer,
+                        &stats,
+                        &mut last_flush,
+                        &mut bytes_written_since_flush,
+                    );
+
+                    while let Ok(cmd) = rx.try_recv() {
+                        if let LoggerCommand::Msg(log) = cmd {
+                            TLS_FORMAT_BUF.with(|buf_cell| {
+                                let mut buf = buf_cell.borrow_mut();
+                                buf.clear();
+                                let _ = write!(
+                                    buf,
+                                    "{} [{}] {}\n",
+                                    Local::now().format("%Y-%m-%d %H:%M:%S"),
+                                    log.level.as_str(),
+                                    log.msg
+                                );
+                                let _ = writer.write_all(buf.as_bytes());
+                            });
+                            stats.messages_written.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+
+                    let _ = writer.flush();
+                    stats.flushes_performed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+
+                Err(_) => {
+                    write_batch(
+                        &mut batch,
+                        &mut writer,
+                        &stats,
+                        &mut bytes_written_since_flush,
+                    );
+                    let _ = writer.flush();
+                    stats.flushes_performed.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
     }
 
     #[inline(always)]
     pub fn log(&self, level: LogLevel, msg: CompactString) {
         if let Some(ref sender) = self.sender {
-            let log_msg = LogMsg {
-                timestamp: Local::now(),
-                level,
-                msg,
-            };
-            let _ = sender.try_send(log_msg);
+            let log_msg = LogMsg { level, msg };
+            let _ = sender.try_send(LoggerCommand::Msg(log_msg));
         }
     }
 
@@ -201,14 +345,15 @@ impl FLog {
     }
 
     pub fn flush(&self) {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(10));
-        self.shutdown_flag.store(false, Ordering::Relaxed);
+        if let Some(ref sender) = self.sender {
+            let _ = sender.send(LoggerCommand::Flush);
+        }
     }
 
     pub fn shutdown(&mut self) {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
-        self.sender.take();
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(LoggerCommand::Shutdown);
+        }
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }

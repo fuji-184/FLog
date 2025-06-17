@@ -1,6 +1,6 @@
 # f_log
 
-**F Log** is a simple Rust logger
+**F Log** is a simple, fast, and efficient Rust logger
 
 ## Features
 
