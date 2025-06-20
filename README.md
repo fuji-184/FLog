@@ -7,7 +7,6 @@
 - Logging with background flush
 - Configurable logger parameters for latency and throughput
 - Convenient logging macros (`trace!`, `debug!`, `info!`, `warn!`, `error!`)
-- Uses [`compact_str`](https://crates.io/crates/compact_str) for efficient string storage
 - Customizable logger configuration through `LoggerConfig`
 - Automatically flushes logs on panic
 
@@ -26,7 +25,7 @@ Initialize the logger with your preferred configuration and use the logging macr
 
 ```rust
 use std::time::Instant;
-use f_log::{LoggerConfig, GlobalLogHelper, init_global_flog, flush_global, info};
+use f_log::{LoggerConfig, GlobalLogHelper, init_global_flog, info};
 
 fn main() {
     // Initialize global flog with default config
@@ -40,8 +39,6 @@ fn main() {
         info!(g, "Benchmarking log perf: {}", i + 1);
     }
 
-    info!(gf, "Done");
-
     let elapsed = start.elapsed();
     let per_log_ns = elapsed.as_nanos() / iterations as u128;
 
@@ -49,6 +46,25 @@ fn main() {
         "Macro logger: Logged {} entries in {:?} ({} ns/log)",
         iterations, elapsed, per_log_ns
     );
+
+    /*
+        If there is a function that blocks indefinitely, such as one that starts a server
+        you should manually flush the logs before calling that function if you want to see the logs immediately. For example:
+
+        fn main() {
+            // Initialize flog and perform some logging
+
+            flush_global(); // or info!(gf, "Flushed: gf will flush all batched logs");
+            server.run("0.0.0.0:8080");
+        }
+
+        Logs will still be flushed eventually, even if you don't flush manually and keep writing more logs,
+        such as inside an HTTP handler, they will be flushed automatically when
+        the accumulated logs reach certain thresholds defined in the configuration
+    */
+
+
+    // Logs are always automatically flushed before the main function exits.
 }
 ```
 
