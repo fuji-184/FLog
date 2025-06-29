@@ -1,4 +1,3 @@
-use backtrace::Backtrace;
 use chrono::{DateTime, Local};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_queue::SegQueue;
