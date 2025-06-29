@@ -1,3 +1,4 @@
+use backtrace::Backtrace;
 use chrono::{DateTime, Local};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossbeam_queue::SegQueue;
@@ -25,10 +26,10 @@ impl LogLevel {
     const fn as_str(self) -> &'static str {
         match self {
             LogLevel::Trace => "TRACE",
-            LogLevel::Debug => "DEBUG",
-            LogLevel::Info => "INFO",
-            LogLevel::Warn => "WARN",
-            LogLevel::Error => "ERROR",
+            LogLevel::Debug => "\x1b[34mDEBUG\x1b[0m",
+            LogLevel::Info => "\x1b[32mINFO\x1b[0m",
+            LogLevel::Warn => "	\x1b[33mWARN\x1b[0m",
+            LogLevel::Error => "\x1b[31mERROR\x1b[0m",
         }
     }
 }
@@ -62,12 +63,53 @@ impl FLog {
     }
 
     pub fn with_config(config: LoggerConfig) -> Self {
-        panic::set_hook(Box::new(|_| {
+        panic::set_hook(Box::new(|info| {
             #[cfg(feature = "global")]
             flush_global();
 
             #[cfg(feature = "local")]
             flush_local();
+
+            let msg = match info.payload().downcast_ref::<&str>() {
+                Some(isi) => isi,
+                None => "No panic message was set",
+            };
+
+            if let Some(location) = info.location() {
+                #[cfg(feature = "global")]
+                error!(
+                    g,
+                    "\x1b[31mPanic\x1b[0m occurred in file \x1b[31m'{}'\x1b[0m at line \x1b[31m{}\x1b[0m, at character \x1b[31m{}\x1b[0m, message : {}",
+                    location.file(),
+                    location.line(),
+                    location.column(),
+                    msg
+                );
+
+                #[cfg(feature = "local")]
+                error!(
+                    l,
+                    "\x1b[31mPanic\x1b[0m occurred in file \x1b[31m'{}'\x1b[0m at line \x1b[31m{}\x1b[0m, at character \x1b[31m{}\x1b[0m, message : {}",
+                    location.file(),
+                    location.line(),
+                    location.column(),
+                    msg
+                );
+            } else {
+                #[cfg(feature = "global")]
+                error!(
+                    g,
+                    "\x1b[31mPanic\x1b[0m occurred but location info is unavailable, message : {}",
+                    msg
+                );
+
+                #[cfg(feature = "local")]
+                error!(
+                    l,
+                    "\x1b[31mPanic\x1b[0m occurred but location info is unavailable, message : {}",
+                    msg
+                );
+            }
         }));
         let (tx, rx) = unbounded::<LoggerCommand>();
 
@@ -215,7 +257,7 @@ fn writer_loop(rx: Receiver<LoggerCommand>, config: LoggerConfig, pool: Arc<Stri
                 _ = write!(ts, "{}", time.format("%Y-%m-%d %H:%M:%S"));
             }
             let _ = write!(buf, "{} [{}] {}\n", ts, log.level.as_str(), log.msg);
-            pool.put(log.msg); // ✅ pindahkan msg-nya
+            pool.put(log.msg);
         }
 
         let _ = writer.write_all(buf.as_bytes());
